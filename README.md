@@ -17,6 +17,7 @@
 ```
 docs/kernelsu-hide-audit.md             完整审计报告（证据 file:line / 检测手法 / 改造方案 / 验收清单 / 路线图）
 docs/batch2-hide-path-and-scrub.md      第 2 批设计说明：LSM hook 点与 VFS 调用链证据、代价、限制、验证方法
+docs/packaging-and-auto-install.md      打包与"自动修补安装"：keystore→常量→.ko→ksud→APK 的完整闭环
 patches/ksu-hide-and-perf.patch         第 1 批：日志/权限/热路径（7 文件，已通过 git apply --check）
 patches/ksu-hide-path-and-scrub.patch   第 2 批：路径隐藏 + 读取擦除（8 文件 / +759 行，已通过 git apply --check）
 tools/detect-ksu.c                      检测 PoC：验证补丁前/后"任意 App 能否判定 KernelSU"
