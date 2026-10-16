@@ -15,12 +15,14 @@
 ## 仓库内容
 
 ```
-docs/kernelsu-hide-audit.md        完整审计报告（证据 file:line / 检测手法 / 改造方案 / 验收清单 / 路线图）
-patches/ksu-hide-and-perf.patch    可直接 git apply 的补丁（7 文件，已通过 git apply --check）
-tools/detect-ksu.c                 检测 PoC：验证补丁前/后"任意 App 能否判定 KernelSU"
-tools/verify-device.sh             设备端自测清单（在 shell uid 下逐条回归）
-tools/gen-patch.ps1                从新鲜的上游源码重新生成补丁（可复现）
-upload.ps1                         推送助手（token 走环境变量，不落盘）
+docs/kernelsu-hide-audit.md             完整审计报告（证据 file:line / 检测手法 / 改造方案 / 验收清单 / 路线图）
+docs/batch2-hide-path-and-scrub.md      第 2 批设计说明：LSM hook 点与 VFS 调用链证据、代价、限制、验证方法
+patches/ksu-hide-and-perf.patch         第 1 批：日志/权限/热路径（7 文件，已通过 git apply --check）
+patches/ksu-hide-path-and-scrub.patch   第 2 批：路径隐藏 + 读取擦除（8 文件 / +759 行，已通过 git apply --check）
+tools/detect-ksu.c                      检测 PoC：验证补丁前/后"任意 App 能否判定 KernelSU"
+tools/verify-device.sh                  设备端自测清单（在未授权 uid 下逐条回归）
+tools/gen-patch.ps1                     从新鲜的上游源码重新生成第 1 批补丁（可复现）
+upload.ps1                              推送助手（token 走环境变量，不落盘）
 ```
 
 ## 补丁包含什么
@@ -31,17 +33,32 @@ upload.ps1                         推送助手（token 走环境变量，不落
 3. **内核日志指纹清理**：release 构建去掉 `"KernelSU: "` 前缀（`kernel/include/klog.h`）、开机 banner 与 IOCTL 表 dump 收进 `CONFIG_KSU_DEBUG`、zygote fork / 逐进程标记 / 音量键等热路径 `pr_info` → `pr_debug`。
 4. **热路径门禁**：`ksu_handle_sys_read` / `ksu_sys_fstat` 加 `current->pid != 1` 快速返回，消除"系统每一次 `read()`/`fstat()` 都要 `fget()`+`d_path()`"的开销。
 
+## 第 2 批补丁包含什么
+
+1. **路径隐藏** `kernel/feature/hide_path.c`（新）+ `kernel/include/ksu_hide.h`（新）
+   `/data/adb`、`/metadata/ksu`、`/metadata/watchdog/ksu`、`/debug_ramdisk/.ksu`、`/proc/config.gz` 对 App / isolated / shell 返回 **ENOENT**（不是 EACCES）。走 LSM 而不是 syscall dispatcher，因为 dispatcher 只对打标记的进程生效，而普通 App 恰恰没标记；`statx` 由 `vfs_getattr → security_inode_getattr` 天然覆盖。
+2. **读取内容擦除** `kernel/feature/scrub.c`（新）
+   对 `/proc/kallsyms`、`/proc/modules`、`/proc/cmdline`、`/sys/fs/selinux/policy` 做**等长改名**（`ksu_`→`zram_`、`kernelsu`→`zram_mod`、`ksu_file`→`zrm_file` …），读取照常成功但 `grep -i ksu` 一条不中；二进制策略因长度不变而仍然可解析、自洽。安装点是 `file_open` LSM 钩子 + `file_operations` 副本代理，只包 `read`/`read_iter`。
+3. 接线：`kernel/Kbuild`（两个新对象）、`kernel/core/init.c`（init/exit）、`kernel/runtime/boot_event.c`（post-fs-data / module-mounted / boot-completed 重新解析缓存 inode，因为 `/data` 在 init 阶段还没挂载）。
+
+设计依据、覆盖的读取路径、7 条已知限制与验收命令见 [docs/batch2-hide-path-and-scrub.md](docs/batch2-hide-path-and-scrub.md)。
+
 ## 应用补丁
 
 ```sh
 git clone https://github.com/tiann/KernelSU.git && cd KernelSU
 git checkout 9f5966b4d534869fd72a79b3c6ea602e5eae3022   # 或任意接近的 main 提交
+
 git apply --check /path/to/patches/ksu-hide-and-perf.patch
+git apply --check /path/to/patches/ksu-hide-path-and-scrub.patch
 git apply /path/to/patches/ksu-hide-and-perf.patch
+git apply /path/to/patches/ksu-hide-path-and-scrub.patch
 
 # 内核模块
 cd kernel && ./build-all.sh            # 或 make -C $KDIR M=$PWD CONFIG_KSU=m modules
 ```
+
+两个补丁互不重叠，可以只打其中一个。第 2 批里每个特性都有自己的编译期开关（`KSU_HIDE_PATH_ENABLE` / `KSU_SCRUB_ENABLE`），改成 0 即整体关闭。
 
 补丁是纯文本改动，不依赖本次快照的绝对路径，可直接对上一条主线提交使用（`--check` 通过即上下文匹配）。
 

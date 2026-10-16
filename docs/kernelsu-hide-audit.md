@@ -258,10 +258,10 @@ static ssize_t my_read_policy(struct file *filp, char __user *buf, size_t count,
 
 | 批次 | 内容 | 工作量 | 风险 |
 |---|---|---|---|
-| 第 1 批（立即） | `ksu-hide-and-perf.patch`（B1 门禁 + B2 日志 + P1 热路径门禁） | 0.5 天 | 低（仅 `GET_INFO` 权限收紧需回归 manager） |
-| 第 2 批 | B4 路径伪装（含 `statx`）+ B3 kallsyms/module 过滤 | 2–3 天 | 中（syscall hook 增多，注意 dispatcher 开销） |
-| 第 3 批 | B5 策略 dump 伪装 + B6 config/cmdline 伪装 | 2 天 | 中（SELinux 侧改动需充分回归） |
-| 第 4 批 | B8/B9/B10 userspace + manager 去特征化，含 `repack_apk.py` 改名闭环 | 3–5 天 | 中高（跨组件改名，必须一起改） |
+| 第 1 批（立即） | `ksu-hide-and-perf.patch`（B1 门禁 + B2 日志 + P1 热路径门禁） | 0.5 天 | ✅ 已实现 |
+| 第 2 批 | B4 路径伪装（含 `statx`）+ B5 策略 dump 擦除 + B6 config/cmdline；B3 只做了名字擦除 | — | ✅ 已实现：`ksu-hide-path-and-scrub.patch`（说明见 `batch2-hide-path-and-scrub.md`）；改动落在 LSM 热路径槽位上，需按 KMI 编译验证 |
+| 第 3 批 | B3 模块列表/符号条目级过滤 + B10 挂载视图过滤 | 2 天 | 中（procfs seq_file 条目过滤要动 show 函数） |
+| 第 4 批 | B7 anon inode 名中性化 + B8/B9 userspace + manager 去特征化，含 `repack_apk.py` 改名闭环 | 3–5 天 | 中高（跨组件改名，必须一起改） |
 | 第 5 批 | P3/P4/P5 的架构性优化（tracepoint 标记策略、seccomp 布局、lsm 槽表） | 3 天 | 中（动的是核心 hook 机制） |
 
 > 一句话：**先补那个"任意 App 一行 syscall 就能判定 KSU"的门禁**，再处理日志与热路径；改名/符号隐藏这类"看起来更酷"的改造，收益反而不如这两条直接。

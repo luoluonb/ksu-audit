@@ -1,0 +1,854 @@
+diff --git a/kernel/Kbuild b/kernel/Kbuild
+index 6c92a01..16b208d 100644
+--- a/kernel/Kbuild
++++ b/kernel/Kbuild
+@@ -56,6 +56,12 @@ kernelsu-objs += feature/adb_root.o
+ kernelsu-objs += feature/selinux_hide.o
+ kernelsu-objs += feature/shell_su_adb_only.o
+ 
++# Anti-detection: hide KernelSU's own paths from apps/shell, and scrub its
++# name out of the files that cannot be hidden. Both files carry their own
++# compile-time switch (KSU_HIDE_PATH_ENABLE / KSU_SCRUB_ENABLE).
++kernelsu-objs += feature/hide_path.o
++kernelsu-objs += feature/scrub.o
++
+ ifdef KBUILD_EXTMOD
+ ifeq ($(CONFIG_KSU_DISABLE_MANAGER),y)
+ ccflags-y += -DCONFIG_KSU_DISABLE_MANAGER=1
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 0ca7529..be07b6e 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -27,6 +27,8 @@
+ #include "feature/selinux_hide.h"
+ #include "feature/module_blacklist.h"
+ #include "feature/shell_su_adb_only.h"
++#include "feature/hide_path.h"
++#include "feature/scrub.h"
+ #include "infra/symbol_resolver.h"
+ 
+ #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+@@ -146,6 +148,8 @@ int __init kernelsu_init(void)
+     ksu_lsm_hook_init();
+     ksu_selinux_hide_init();
+     ksu_shell_su_adb_only_init();
++    ksu_hide_path_init();
++    ksu_scrub_init();
+ 
+     ksu_supercalls_init();
+     ksu_app_profile_init();
+@@ -222,6 +226,8 @@ void __exit kernelsu_exit(void)
+     ksu_allowlist_exit();
+ 
+     ksu_shell_su_adb_only_exit();
++    ksu_scrub_exit();
++    ksu_hide_path_exit();
+     ksu_selinux_hide_exit();
+     ksu_lsm_hook_exit();
+     ksu_adb_root_exit();
+diff --git a/kernel/feature/hide_path.c b/kernel/feature/hide_path.c
+new file mode 100644
+index 0000000..0cfbdcc
+--- /dev/null
++++ b/kernel/feature/hide_path.c
+@@ -0,0 +1,224 @@
++// Hide KernelSU's own directory tree from unprivileged processes.
++//
++// The leak being fixed: on a stock device /data/adb does not exist, so an app
++// gets ENOENT from stat("/data/adb"). With KernelSU installed the directory
++// exists and *stat only needs search permission on the parents* -- /data is
++// world-searchable -- so the same stat() succeeds for any app, and
++// stat("/data/adb/ksu") answers EACCES instead of ENOENT. That errno
++// difference alone is a one-line root probe that needs no permission at all.
++//
++// Why LSM hooks instead of the syscall dispatcher:
++//   hook/syscall_hook_manager.c only routes syscalls of *marked* tasks (see
++//   hook/tp_marker.c) and ordinary apps are deliberately left unmarked, so a
++//   dispatcher based filter would not see the very processes we care about.
++//   security_inode_getattr() / security_inode_permission() on the other hand
++//   are consulted for every task, with the path already resolved:
++//
++//     stat/lstat/fstatat/statx/fstat -> vfs_getattr()            (fs/stat.c:196)
++//                                    -> security_inode_getattr() (fs/stat.c:204)
++//     access/faccessat/open/opendir  -> inode_permission()        (fs/namei.c:510)
++//                                    -> security_inode_permission() (fs/namei.c:543)
++//
++//   Children are covered for free: resolving "ksu" below /data/adb requires
++//   MAY_EXEC (search) on /data/adb, which we deny.
++//
++// Cost: the hook is on a hot path, so the fast path is a single uid load
++// (system/root traffic returns immediately) and the slow path compares the
++// inode against a small resolved-pointer table.
++
++#include <linux/dcache.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/namei.h>
++#include <linux/path.h>
++#include <linux/types.h>
++
++#include "feature/hide_path.h"
++#include "hook/lsm_hook.h"
++#include "klog.h" // IWYU pragma: keep
++#include "ksu.h"
++#include "ksu_hide.h"
++
++// Compile-time switch. Flip to 0 to build KernelSU without path hiding.
++#define KSU_HIDE_PATH_ENABLE 1
++
++/*
++ * Paths that are created by KernelSU and must not be visible to apps.
++ * Paths that do not exist are skipped, so listing optional ones is free.
++ */
++struct ksu_hide_entry {
++    const char *path;
++    struct inode *inode;
++    unsigned long ino;
++    dev_t dev;
++};
++
++static struct ksu_hide_entry ksu_hide_entries[] = {
++    { .path = "/data/adb" },
++    { .path = "/metadata/ksu" },
++    { .path = "/metadata/watchdog/ksu" },
++    { .path = "/debug_ramdisk/.ksu" },
++    /*
++     * GKI builds do not ship /proc/config.gz (IKCONFIG_PROC is off) and this
++     * file would otherwise advertise CONFIG_KSU=y to any app on a custom
++     * kernel that does enable it, so hide it where it exists.
++     */
++    { .path = "/proc/config.gz" },
++};
++
++static bool ksu_hide_path_any_resolved;
++
++static const char *const ksu_hide_getattr_targets[] = {
++    "selinux_inode_getattr",
++    "bpf_lsm_inode_getattr",
++};
++
++static const char *const ksu_hide_permission_targets[] = {
++    "selinux_inode_permission",
++    "bpf_lsm_inode_permission",
++};
++
++static bool ksu_hide_match_inode(const struct inode *inode)
++{
++    size_t i;
++
++    if (!inode || !ksu_hide_path_any_resolved) {
++        return false;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(ksu_hide_entries); i++) {
++        const struct ksu_hide_entry *e = &ksu_hide_entries[i];
++        struct inode *cached = smp_load_acquire(&e->inode);
++
++        if (!cached) {
++            continue;
++        }
++
++        /*
++         * Compare the pointer *and* the (dev, ino) pair: the cached pointer is
++         * not reference counted (that would pin the inode forever), so this
++         * guards against the address being reused by an unrelated file after
++         * the original was deleted.
++         */
++        if (cached == inode && e->ino == inode->i_ino && e->dev == inode->i_sb->s_dev) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static int __nocfi ksu_inode_getattr(const struct path *path);
++static int __nocfi ksu_inode_permission(struct inode *inode, int mask);
++
++static struct ksu_lsm_hook ksu_inode_getattr_hook =
++    KSU_LSM_HOOK_INIT(inode_getattr, "selinux_inode_getattr", ksu_inode_getattr, 0);
++static struct ksu_lsm_hook ksu_inode_permission_hook =
++    KSU_LSM_HOOK_INIT(inode_permission, "selinux_inode_permission", ksu_inode_permission, 0);
++
++static int __nocfi ksu_inode_getattr(const struct path *path)
++{
++    int (*orig)(const struct path *) = ksu_inode_getattr_hook.original;
++
++    if (unlikely(ksu_uid_is_hidden_target(current_uid().val)) && path &&
++        ksu_hide_match_inode(d_inode(path->dentry))) {
++        return -ENOENT;
++    }
++
++    return orig(path);
++}
++
++static int __nocfi ksu_inode_permission(struct inode *inode, int mask)
++{
++    int (*orig)(struct inode *, int) = ksu_inode_permission_hook.original;
++
++    if (unlikely(ksu_uid_is_hidden_target(current_uid().val)) && ksu_hide_match_inode(inode)) {
++        return -ENOENT;
++    }
++
++    return orig(inode, mask);
++}
++
++static void ksu_hide_resolve_entries(void)
++{
++    const struct cred *old_cred;
++    size_t i;
++
++    old_cred = override_creds(ksu_cred);
++
++    for (i = 0; i < ARRAY_SIZE(ksu_hide_entries); i++) {
++        struct ksu_hide_entry *e = &ksu_hide_entries[i];
++        struct path path;
++        struct inode *inode;
++
++        if (smp_load_acquire(&e->inode)) {
++            continue;
++        }
++
++        if (kern_path(e->path, 0, &path)) {
++            continue;
++        }
++
++        inode = d_backing_inode(path.dentry);
++        if (inode) {
++            e->ino = inode->i_ino;
++            e->dev = inode->i_sb->s_dev;
++            smp_store_release(&e->inode, inode);
++            ksu_hide_path_any_resolved = true;
++            pr_debug("hide_path: hiding %s\n", e->path);
++        }
++
++        path_put(&path);
++    }
++
++    revert_creds(old_cred);
++}
++
++void ksu_hide_path_refresh(void)
++{
++#if !KSU_HIDE_PATH_ENABLE
++    return;
++#else
++    if (!ksu_inode_permission_hook.original && !ksu_inode_getattr_hook.original) {
++        return;
++    }
++
++    ksu_hide_resolve_entries();
++#endif
++}
++
++void __init ksu_hide_path_init(void)
++{
++#if !KSU_HIDE_PATH_ENABLE
++    pr_debug("hide_path: disabled at build time\n");
++    return;
++#else
++    int ret;
++
++    ret = ksu_lsm_hook_first(&ksu_inode_getattr_hook, ksu_hide_getattr_targets,
++                             ARRAY_SIZE(ksu_hide_getattr_targets));
++    if (ret) {
++        pr_warn("hide_path: inode_getattr hook failed: %d\n", ret);
++    }
++
++    ret = ksu_lsm_hook_first(&ksu_inode_permission_hook, ksu_hide_permission_targets,
++                             ARRAY_SIZE(ksu_hide_permission_targets));
++    if (ret) {
++        pr_warn("hide_path: inode_permission hook failed: %d\n", ret);
++        ksu_lsm_unhook(&ksu_inode_getattr_hook);
++        return;
++    }
++
++    ksu_hide_resolve_entries();
++#endif
++}
++
++void __exit ksu_hide_path_exit(void)
++{
++#if !KSU_HIDE_PATH_ENABLE
++    return;
++#else
++    ksu_lsm_unhook(&ksu_inode_permission_hook);
++    ksu_lsm_unhook(&ksu_inode_getattr_hook);
++#endif
++}
+diff --git a/kernel/feature/hide_path.h b/kernel/feature/hide_path.h
+new file mode 100644
+index 0000000..43970e6
+--- /dev/null
++++ b/kernel/feature/hide_path.h
+@@ -0,0 +1,15 @@
++#ifndef __KSU_H_HIDE_PATH
++#define __KSU_H_HIDE_PATH
++
++/*
++ * Make KernelSU's own directories look absent (ENOENT, not EACCES) to
++ * unprivileged processes. See feature/hide_path.c for the rationale.
++ */
++void ksu_hide_path_init(void);
++void ksu_hide_path_exit(void);
++
++/* Re-resolve cached inodes; call from the boot stages because some of these
++ * paths are created by userspace (ksud) after the module is loaded. */
++void ksu_hide_path_refresh(void);
++
++#endif // __KSU_H_HIDE_PATH
+diff --git a/kernel/feature/scrub.c b/kernel/feature/scrub.c
+new file mode 100644
+index 0000000..46bac67
+--- /dev/null
++++ b/kernel/feature/scrub.c
+@@ -0,0 +1,408 @@
++// Scrub KernelSU's identifying strings out of the files that leak them.
++//
++// Some files cannot be made to disappear: on a stock Android build they exist
++// and are readable (at least by shell), so returning ENOENT for them would be
++// a signal in itself. For those we let the read succeed and rewrite the few
++// strings that name us, keeping the byte length identical:
++//
++//   /proc/kallsyms          ksu_handle_*   -> zram_handle_*   (symbol names)
++//                           [kernelsu]     -> [zram_mod]      (module tag)
++//   /proc/modules           kernelsu       -> zram_mod
++//   /proc/cmdline           *ksu*          -> *zram*
++//   /sys/fs/selinux/policy  u:r:ksu:s0     -> u:r:zrm:s0      (type names)
++//
++// Equal length matters twice: the SELinux policy dump is a binary format with
++// length-prefixed strings (so a same-length rename keeps it parseable and
++// self-consistent), and readers may have already computed buffer offsets.
++//
++// Mechanism: the LSM file_open hook sees every open with f_op already set and
++// the path resolved, so for the handful of target inodes we swap in a copy of
++// the file's f_op whose read/read_iter scrub the bytes the original
++// implementation just produced. Root, the manager and granted uids are never
++// touched, and files opened by other processes are independent (f_op lives in
++// struct file), so nothing bleeds across processes.
++//
++// Cost: file_open runs for every open in the system, so the fast path is one
++// resolved-flag test plus one uid test; the inode comparison only runs for the
++// audience we hide from.
++
++#include <linux/cred.h>
++#include <linux/dcache.h>
++#include <linux/errno.h>
++#include <linux/fs.h>
++#include <linux/namei.h>
++#include <linux/pagemap.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/uio.h>
++#include <linux/version.h>
++
++#include "feature/scrub.h"
++#include "hook/lsm_hook.h"
++#include "klog.h" // IWYU pragma: keep
++#include "ksu.h"
++#include "ksu_hide.h"
++
++// Compile-time switch. Flip to 0 to build KernelSU without read scrubbing.
++#define KSU_SCRUB_ENABLE 1
++
++struct ksu_scrub_rule {
++    const char *needle;
++    const char *replacement; // must be the same byte length as needle
++};
++
++/*
++ * Longest needle first. All occurrences get the same replacement, so a type
++ * name that appears in several sections of the SELinux policy dump stays
++ * consistent, and the replacements are picked to look like ordinary kernel
++ * names rather than like redaction.
++ */
++static const struct ksu_scrub_rule ksu_scrub_rules[] = {
++    { "kernel_su", "zram_file" }, // 9 : KERNEL_SU_FILE style type name
++    { "kernelsu", "zram_mod" }, // 8 : module name in /proc/modules, kallsyms tags
++    { "KernelSU", "ZramMods" }, // 8
++    { "ksud", "zram" }, // 4 : the daemon path/name in cmdline
++    { "ksu_", "zram_" }, // 4 : every symbol KernelSU defines
++    { "ksu", "zrm" }, // 3 : KERNEL_SU_DOMAIN "ksu", remaining paths
++};
++
++// A length mismatch would corrupt the binary policy dump: fail the build.
++_Static_assert(sizeof("kernel_su") == sizeof("zram_file"), "scrub rule length mismatch");
++_Static_assert(sizeof("kernelsu") == sizeof("zram_mod"), "scrub rule length mismatch");
++_Static_assert(sizeof("KernelSU") == sizeof("ZramMods"), "scrub rule length mismatch");
++_Static_assert(sizeof("ksud") == sizeof("zram"), "scrub rule length mismatch");
++_Static_assert(sizeof("ksu_") == sizeof("zram_"), "scrub rule length mismatch");
++_Static_assert(sizeof("ksu") == sizeof("zrm"), "scrub rule length mismatch");
++
++struct ksu_scrub_proxy {
++    struct file_operations fops; // copy of the original, read/read_iter wrapped
++    ssize_t (*orig_read)(struct file *, char __user *, size_t, loff_t *);
++    ssize_t (*orig_read_iter)(struct kiocb *, struct iov_iter *);
++};
++
++struct ksu_scrub_target {
++    const char *path;
++    struct ksu_scrub_proxy proxy;
++    struct inode *inode;
++    unsigned long ino;
++    dev_t dev;
++};
++
++static struct ksu_scrub_target ksu_scrub_targets[] = {
++    { .path = "/proc/kallsyms" },
++    { .path = "/proc/modules" },
++    { .path = "/proc/cmdline" },
++    // The dumped policy still contains the KernelSU types and the rules that
++    // were added to it (see selinux/rules.c); renaming the strings in place is
++    // what keeps it consistent.
++    { .path = "/sys/fs/selinux/policy" },
++};
++
++static bool ksu_scrub_any_ready;
++
++static const char *const ksu_scrub_file_open_targets[] = {
++    "selinux_file_open",
++    "bpf_lsm_file_open",
++};
++
++/* Replace every occurrence of a rule needle inside a kernel buffer. */
++static void ksu_scrub_bytes(char *buf, size_t len)
++{
++    size_t r;
++
++    for (r = 0; r < ARRAY_SIZE(ksu_scrub_rules); r++) {
++        const struct ksu_scrub_rule *rule = &ksu_scrub_rules[r];
++        size_t nlen = strlen(rule->needle);
++        size_t i = 0;
++
++        if (!nlen || nlen > len) {
++            continue;
++        }
++
++        while (i + nlen <= len) {
++            if (!memcmp(buf + i, rule->needle, nlen)) {
++                memcpy(buf + i, rule->replacement, nlen);
++                i += nlen;
++            } else {
++                i++;
++            }
++        }
++    }
++}
++
++#define KSU_SCRUB_CHUNK 512
++/* A needle can straddle a chunk boundary: hold back this many bytes and
++ * rescan them with the next chunk. Must be >= longest needle - 1. */
++#define KSU_SCRUB_OVERLAP 16
++
++/*
++ * Scrub a buffer that was just filled in userspace. Works chunk-wise with an
++ * overlap so the kernel stack cost stays at a few hundred bytes regardless of
++ * how much the caller asked for.
++ */
++static void ksu_scrub_user_buf(char __user *ubuf, size_t len)
++{
++    char tmp[KSU_SCRUB_CHUNK + KSU_SCRUB_OVERLAP];
++    size_t pos = 0; // bytes of ubuf already processed
++    size_t carry = 0; // bytes held back from the previous round
++
++    while (pos < len) {
++        size_t want = len - pos;
++        size_t total, keep, flush;
++
++        if (want > KSU_SCRUB_CHUNK) {
++            want = KSU_SCRUB_CHUNK;
++        }
++        if (copy_from_user(tmp + carry, ubuf + pos, want)) {
++            return;
++        }
++
++        total = carry + want;
++        ksu_scrub_bytes(tmp, total);
++
++        keep = (pos + want < len && total > KSU_SCRUB_OVERLAP) ? KSU_SCRUB_OVERLAP : 0;
++        flush = total - keep;
++
++        if (copy_to_user(ubuf + pos - carry, tmp, flush)) {
++            return;
++        }
++
++        if (keep) {
++            memmove(tmp, tmp + flush, keep);
++        }
++        pos += want;
++        carry = keep;
++    }
++
++    if (carry) {
++        copy_to_user(ubuf + len - carry, tmp, carry);
++    }
++}
++
++static struct ksu_scrub_target *ksu_scrub_target_of(const struct file *file)
++{
++    size_t i;
++
++    if (!file || !file->f_op) {
++        return NULL;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(ksu_scrub_targets); i++) {
++        if (file->f_op == &ksu_scrub_targets[i].proxy.fops) {
++            return &ksu_scrub_targets[i];
++        }
++    }
++
++    return NULL;
++}
++
++static ssize_t ksu_scrub_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++    struct ksu_scrub_target *t = ksu_scrub_target_of(file);
++    ssize_t ret;
++
++    if (unlikely(!t || !t->proxy.orig_read)) {
++        return -EIO;
++    }
++
++    ret = t->proxy.orig_read(file, buf, count, ppos);
++    if (ret > 0) {
++        ksu_scrub_user_buf(buf, (size_t)ret);
++    }
++
++    return ret;
++}
++
++static ssize_t ksu_scrub_read_iter(struct kiocb *iocb, struct iov_iter *to)
++{
++    struct ksu_scrub_target *t = ksu_scrub_target_of(iocb->ki_filp);
++    ssize_t ret;
++
++    if (unlikely(!t || !t->proxy.orig_read_iter)) {
++        return -EIO;
++    }
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
++    /*
++     * A single-buffer destination (pread/preadv with one iovec) is the only
++     * shape we can rewrite without touching the zero-copy paths: remember
++     * where the data starts, let the original implementation run, then scrub
++     * exactly the bytes it produced.
++     */
++    if (to->iter_type == ITER_UBUF) {
++        void __user *start = to->ubuf;
++        size_t before = iov_iter_count(to);
++        size_t consumed;
++
++        ret = t->proxy.orig_read_iter(iocb, to);
++        if (ret <= 0) {
++            return ret;
++        }
++
++        consumed = before - iov_iter_count(to);
++        if (consumed > (size_t)ret) {
++            consumed = (size_t)ret;
++        }
++        if (consumed) {
++            ksu_scrub_user_buf(start, consumed);
++        }
++
++        return ret;
++    }
++#endif
++
++    /* Pipe/splice and multi-segment destinations are passed through untouched
++     * so the semantics of those paths are exactly what they were. */
++    return t->proxy.orig_read_iter(iocb, to);
++}
++
++static void ksu_scrub_maybe_install(struct file *file)
++{
++    size_t i;
++
++    if (!file->f_op || !file->f_op->read) {
++        return;
++    }
++
++    if (!ksu_uid_is_hidden_target(current_uid().val)) {
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(ksu_scrub_targets); i++) {
++        struct ksu_scrub_target *t = &ksu_scrub_targets[i];
++        struct inode *cached = smp_load_acquire(&t->inode);
++        struct inode *inode;
++
++        if (!cached || !t->proxy.fops.read) {
++            continue;
++        }
++
++        inode = file_inode(file);
++        if (!inode || cached != inode || t->ino != inode->i_ino || t->dev != inode->i_sb->s_dev) {
++            continue;
++        }
++
++        file->f_op = &t->proxy.fops;
++        pr_debug("scrub: filtering reads of %s for uid %d\n", t->path, current_uid().val);
++        break;
++    }
++}
++
++static int __nocfi ksu_scrub_file_open(struct file *file);
++static struct ksu_lsm_hook ksu_scrub_file_open_hook = KSU_LSM_HOOK_INIT(file_open, "selinux_file_open", ksu_scrub_file_open, 0);
++
++static int __nocfi ksu_scrub_file_open(struct file *file)
++{
++    int (*orig)(struct file *) = ksu_scrub_file_open_hook.original;
++
++    if (likely(ksu_scrub_any_ready)) {
++        ksu_scrub_maybe_install(file);
++    }
++
++    return orig(file);
++}
++
++static void ksu_scrub_prepare_targets(void)
++{
++    const struct cred *old_cred;
++    size_t i;
++
++    old_cred = override_creds(ksu_cred);
++
++    for (i = 0; i < ARRAY_SIZE(ksu_scrub_targets); i++) {
++        struct ksu_scrub_target *t = &ksu_scrub_targets[i];
++        const struct file_operations *orig;
++        struct path path;
++        struct inode *inode;
++        struct file *f;
++
++        if (smp_load_acquire(&t->inode)) {
++            continue;
++        }
++
++        if (kern_path(t->path, 0, &path)) {
++            continue;
++        }
++        inode = d_backing_inode(path.dentry);
++        path_put(&path);
++        if (!inode) {
++            continue;
++        }
++
++        f = filp_open(t->path, O_RDONLY, 0);
++        if (IS_ERR(f)) {
++            continue;
++        }
++
++        /*
++         * Copy the live file_operations and only wrap the two read entry
++         * points. Everything else (owner, llseek, release, poll, ...) is
++         * inherited, so the file keeps behaving exactly as before for every
++         * path we do not touch.
++         */
++        orig = f->f_op;
++        if (orig && orig->read) {
++            memcpy(&t->proxy.fops, orig, sizeof(struct file_operations));
++            t->proxy.orig_read = orig->read;
++            t->proxy.fops.read = ksu_scrub_read;
++            if (orig->read_iter) {
++                t->proxy.orig_read_iter = orig->read_iter;
++                t->proxy.fops.read_iter = ksu_scrub_read_iter;
++            }
++
++            t->ino = inode->i_ino;
++            t->dev = inode->i_sb->s_dev;
++            smp_store_release(&t->inode, inode);
++            ksu_scrub_any_ready = true;
++            pr_debug("scrub: filtering %s\n", t->path);
++        }
++
++        filp_close(f, NULL);
++    }
++
++    revert_creds(old_cred);
++}
++
++void ksu_scrub_refresh(void)
++{
++#if !KSU_SCRUB_ENABLE
++    return;
++#else
++    if (!ksu_scrub_file_open_hook.original) {
++        return;
++    }
++
++    ksu_scrub_prepare_targets();
++#endif
++}
++
++void __init ksu_scrub_init(void)
++{
++#if !KSU_SCRUB_ENABLE
++    pr_debug("scrub: disabled at build time\n");
++    return;
++#else
++    int ret;
++
++    ret = ksu_lsm_hook_first(&ksu_scrub_file_open_hook, ksu_scrub_file_open_targets,
++                             ARRAY_SIZE(ksu_scrub_file_open_targets));
++    if (ret) {
++        pr_warn("scrub: file_open hook failed: %d\n", ret);
++        return;
++    }
++
++    ksu_scrub_prepare_targets();
++#endif
++}
++
++void __exit ksu_scrub_exit(void)
++{
++#if !KSU_SCRUB_ENABLE
++    return;
++#else
++    ksu_lsm_unhook(&ksu_scrub_file_open_hook);
++    ksu_scrub_any_ready = false;
++#endif
++}
+diff --git a/kernel/feature/scrub.h b/kernel/feature/scrub.h
+new file mode 100644
+index 0000000..581551c
+--- /dev/null
++++ b/kernel/feature/scrub.h
+@@ -0,0 +1,15 @@
++#ifndef __KSU_H_SCRUB
++#define __KSU_H_SCRUB
++
++/*
++ * Rewrite KernelSU's identifying strings out of the few files that leak them
++ * to unprivileged readers but cannot simply be hidden. See feature/scrub.c.
++ */
++void ksu_scrub_init(void);
++void ksu_scrub_exit(void);
++
++/* Re-resolve cached inodes; call from the boot stages in case a target file
++ * only appears later (or is replaced). */
++void ksu_scrub_refresh(void);
++
++#endif // __KSU_H_SCRUB
+diff --git a/kernel/include/ksu_hide.h b/kernel/include/ksu_hide.h
+new file mode 100644
+index 0000000..8a282f8
+--- /dev/null
++++ b/kernel/include/ksu_hide.h
+@@ -0,0 +1,75 @@
++#ifndef __KSU_H_KSU_HIDE
++#define __KSU_H_KSU_HIDE
++
++#include <linux/cred.h>
++#include <linux/types.h>
++
++#include "hook/lsm_hook.h"
++#include "manager/manager_identity.h"
++#include "policy/allowlist.h"
++
++/*
++ * Shared policy for "who is trusted to see KernelSU's own artifacts".
++ *
++ * Authorized: root and any ksu-domain process, the manager app (bound to a
++ * verified APK signature, see manager/apk_sign.c), and uids explicitly granted
++ * root in the allow list.
++ */
++static inline bool ksu_uid_is_authorized(uid_t uid)
++{
++    if (uid == 0) {
++        return true;
++    }
++    if (is_uid_manager(uid)) {
++        return true;
++    }
++    return ksu_is_uid_granted_root(uid);
++}
++
++/* Shell is a debug context, but it is also what an adb-attached checker runs
++ * as, and it is one of the few non-system uids that can read /proc/kallsyms. */
++#define KSU_SHELL_UID 2000
++
++/*
++ * The audience we actively hide from:
++ *   - app uids and isolated processes: the realistic on-device detectors
++ *   - the shell uid: what an adb-attached checker runs as
++ * minus anybody considered authorized.
++ *
++ * System daemons (uid < KSU_SHELL_UID, system_server, zygote, ...) are
++ * deliberately left alone: they have legitimate reasons to walk /data and
++ * /proc, and breaking them would be far more visible than the leak being
++ * fixed here. Root and ksu-domain processes are always allowed through.
++ */
++static inline bool ksu_uid_is_hidden_target(uid_t uid)
++{
++    bool in_scope = uid == KSU_SHELL_UID || is_appuid(uid) || is_isolated_process(uid);
++
++    if (!in_scope) {
++        return false;
++    }
++
++    return !ksu_uid_is_authorized(uid);
++}
++
++/*
++ * Resolve and patch the first LSM hook target that exists. Android kernels
++ * differ in which LSM is compiled in (SELinux always, BPF LSM on some GKI
++ * builds), so try the names in order instead of hardcoding one.
++ */
++static inline int ksu_lsm_hook_first(struct ksu_lsm_hook *hook, const char *const *targets, size_t count)
++{
++    size_t i;
++
++    for (i = 0; i < count; i++) {
++        hook->target_name = targets[i];
++        if (!ksu_lsm_hook(hook)) {
++            return 0;
++        }
++    }
++
++    hook->target_name = targets[0];
++    return -ENOENT;
++}
++
++#endif // __KSU_H_KSU_HIDE
+diff --git a/kernel/runtime/boot_event.c b/kernel/runtime/boot_event.c
+index 91848e6..b73d359 100644
+--- a/kernel/runtime/boot_event.c
++++ b/kernel/runtime/boot_event.c
+@@ -1,4 +1,6 @@
+ #include "feature/selinux_hide.h"
++#include "feature/hide_path.h"
++#include "feature/scrub.h"
+ #include <linux/err.h>
+ #include <linux/fs.h>
+ #include <linux/namei.h>
+@@ -32,6 +34,10 @@ void on_post_fs_data(void)
+     // Sanity check for safe mode only needs early-boot input samples.
+     ksu_stop_input_hook_runtime();
+     ksu_selinux_hide_handle_post_fs_data();
++    // /data/adb and the other hidden paths are created by userspace (ksud), so
++    // resolve them again once /data is mounted.
++    ksu_hide_path_refresh();
++    ksu_scrub_refresh();
+     // retry forced features which failed at second stage
+     ksu_feature_apply_forced();
+ }
+@@ -63,12 +69,16 @@ void on_module_mounted(void)
+ {
+     pr_info("on_module_mounted!\n");
+     ksu_module_mounted = true;
++    ksu_hide_path_refresh();
++    ksu_scrub_refresh();
+ }
+ 
+ void on_boot_completed(void)
+ {
+     ksu_boot_completed = true;
+     pr_info("on_boot_completed!\n");
++    ksu_hide_path_refresh();
++    ksu_scrub_refresh();
+     track_throne(true);
+     ksu_selinux_hide_drop_backup_if_unused();
+ }
