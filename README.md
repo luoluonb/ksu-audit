@@ -12,6 +12,17 @@
 | 版本 | KernelSU v3.3.1，Manager build 32680 |
 | 审计范围 | `kernel/`（内核模块）、`userspace/`（ksud / ksuinit）、`manager/`（管理器 App）、`repack_apk.py`、CI |
 
+## 下载（手机直接用）
+
+**https://github.com/luoluonb/ksu-audit/releases/latest**
+
+| 附件 | 内容 |
+|---|---|
+| `ksu-hide-verify-v1.0.0.zip` | **KernelSU / Magisk 模块包**：刷进管理器 → 模块页点「操作」→ 自动以未授权身份(uid 2000)跑完自检，报告写入 `/data/adb/ksu_check/report.txt` |
+| `ksu-audit-v1.0.0.zip` | 整套：报告 + 两批补丁 + 脚本 + **预编译好的 arm64/arm/x86_64/x86 静态二进制** |
+
+只想跑一次检测、连模块都不想装：直接从仓库下 `bin/detect-ksu-arm64`（静态、免 root）——`adb shell` 或 Termux 里 `chmod 755` 后执行即可。手机端完整说明见 [PHONE-README.md](PHONE-README.md)。
+
 ## 分支地图
 
 | 分支 | 内容 | 用途 |
@@ -24,14 +35,21 @@
 
 ```
 USAGE.md                                操作手册：分支地图 / 体检 / 打补丁 / 编译部署 / 验收 / 回滚 / FAQ
+PHONE-README.md                         手机端说明：怎么下载、怎么刷模块、怎么跑、报告怎么看
 docs/kernelsu-hide-audit.md             完整审计报告（证据 file:line / 检测手法 / 改造方案 / 验收清单 / 路线图）
 docs/batch2-hide-path-and-scrub.md      第 2 批设计说明：LSM hook 点与 VFS 调用链证据、代价、限制、验证方法
 docs/packaging-and-auto-install.md      打包与"自动修补安装"：keystore→常量→.ko→ksud→APK 的完整闭环
+docs/release-notes-v1.0.0.md            v1.0.0 发布说明（含两个发布包的 SHA256）
 patches/ksu-hide-and-perf.patch         第 1 批：日志/权限/热路径（7 文件，已通过 git apply --check）
 patches/ksu-hide-path-and-scrub.patch   第 2 批：路径隐藏 + 读取擦除（8 文件 / +759 行，已通过 git apply --check）
+module/                                 KernelSU 模块源码（module.prop / customize.sh / service.sh / action.sh / tools/run-check.sh）
 tools/detect-ksu.c                      检测 PoC：验证补丁前/后"任意 App 能否判定 KernelSU"
+tools/runas.c                           降权执行器：以指定 uid 运行命令，从 root 侧复现"未授权身份"视角
 tools/verify-device.sh                  设备端自测清单（在未授权 uid 下逐条回归）
 tools/gen-patch.ps1                     从新鲜的上游源码重新生成第 1 批补丁（可复现）
+tools/build-release.ps1                 NDK 交叉编译 + 打两个发布包（可复现）
+tools/publish-release.ps1               创建 GitHub Release 并上传附件（token 走环境变量或本机凭据）
+bin/                                    预编译静态二进制：detect-ksu-{arm64,arm,x86_64,i686} / runas-{arm64,arm}
 upload.ps1                              推送助手（token 走环境变量，不落盘）
 ```
 

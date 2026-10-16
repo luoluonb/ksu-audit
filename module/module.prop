@@ -1,0 +1,6 @@
+id=ksu_hide_verify
+name=KSU Hide Self-Test
+version=v1.0.0
+versionCode=10000
+author=luoluonb
+description=KernelSU 反检测自检工具。装上后在管理器模块页点「操作」即可以未授权身份(uid 2000)跑一遍检测，报告写入 /data/adb/ksu_check/report.txt。仅用于验证，验完建议卸载。

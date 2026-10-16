@@ -10,6 +10,10 @@ patchwork/
 a/
 b/
 
+# 发布产物与编译中间目录（Release 附件不进仓库；dist/ 由 tools/build-release.ps1 生成）
+dist/
+tmp-build/
+
 # 本地临时
 *.log
 *.bak
