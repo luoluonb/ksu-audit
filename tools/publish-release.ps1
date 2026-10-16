@@ -1,4 +1,4 @@
-# publish-release.ps1 -- 在 GitHub 上创建 Release 并上传附件
+﻿# publish-release.ps1 -- 在 GitHub 上创建 Release 并上传附件
 #
 # token 来源（按顺序）：环境变量 GITHUB_TOKEN / GH_TOKEN，或本机 git 凭据（git credential fill）。
 # token 只用于 api.github.com 请求，不落盘、不回显。
@@ -14,12 +14,15 @@ param(
     [Parameter(Mandatory = $true)][string]$Tag,
     [string]$Name = '',
     [string]$BodyFile = '',
-    [string[]]$Assets = @(),
+    # 逗号分隔。刻意用字符串而不是数组：powershell -File 传数组时会被拆坏
+    [string]$Assets = '',
     [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $Name) { $Name = $Tag }
+$assetList = @()
+if ($Assets) { $assetList = @($Assets -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
 function Get-Token {
     foreach ($n in @('GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_PAT')) {
@@ -48,7 +51,7 @@ $api = "https://api.github.com/repos/$Repo"
 
 Write-Host "仓库     : $Repo"
 Write-Host "Tag      : $Tag"
-Write-Host "附件     : $(if ($Assets.Count) { $Assets -join ', ' } else { '(无)' })"
+Write-Host "附件     : $(if ($assetList.Count) { $assetList -join ', ' } else { '(无)' })"
 if ($BodyFile) { Write-Host "说明文件 : $BodyFile" }
 
 if ($DryRun) {
@@ -77,11 +80,17 @@ if (-not $existing) {
 else { $release = $existing }
 
 # --- 2. 上传附件 ---
+# upload_url 形如 https://uploads.github.com/.../assets{?name,label}；某些 PowerShell 版本下
+# -replace 的结果会异常，所以再做一次显式拼接兜底。
 $uploadBase = $release.upload_url -replace '\{\?name,label\}$', ''
-foreach ($a in $Assets) {
+if (-not $uploadBase -or $uploadBase -notmatch '^https://') {
+    $uploadBase = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets"
+}
+Write-Host "上传地址 : $uploadBase"
+foreach ($a in $assetList) {
     $path = (Resolve-Path $a).Path
     $fileName = [System.IO.Path]::GetFileName($path)
-    $url = "$uploadBase?name=$([uri]::EscapeDataString($fileName))"
+    $url = $uploadBase + '?name=' + [uri]::EscapeDataString($fileName)
     $fbytes = [System.IO.File]::ReadAllBytes($path)
     $upHeaders = $headers.Clone()
     $upHeaders['Content-Type'] = 'application/zip'
