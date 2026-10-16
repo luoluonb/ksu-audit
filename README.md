@@ -12,9 +12,18 @@
 | 版本 | KernelSU v3.3.1，Manager build 32680 |
 | 审计范围 | `kernel/`（内核模块）、`userspace/`（ksud / ksuinit）、`manager/`（管理器 App）、`repack_apk.py`、CI |
 
+## 分支地图
+
+| 分支 | 内容 | 用途 |
+|---|---|---|
+| **`main`** | 全部内容：审计报告 + 两批补丁 + 两批设计说明 + 打包闭环说明 + 工具（超集） | **默认分支，文档与补丁都从这里取** |
+| `feature/hide-path-and-scrub` | 第 2 批（路径隐藏 + 读取擦除）的开发分支 | 只想看第 2 批的改动历史 |
+| `audit/kernelsu-hide-and-perf` | 仓库初版（第 1 批补丁 + 检测工具） | 历史存档，内容 `main` 全有 |
+
 ## 仓库内容
 
 ```
+USAGE.md                                操作手册：分支地图 / 体检 / 打补丁 / 编译部署 / 验收 / 回滚 / FAQ
 docs/kernelsu-hide-audit.md             完整审计报告（证据 file:line / 检测手法 / 改造方案 / 验收清单 / 路线图）
 docs/batch2-hide-path-and-scrub.md      第 2 批设计说明：LSM hook 点与 VFS 调用链证据、代价、限制、验证方法
 docs/packaging-and-auto-install.md      打包与"自动修补安装"：keystore→常量→.ko→ksud→APK 的完整闭环
