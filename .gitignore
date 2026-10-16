@@ -1,0 +1,24 @@
+# 构建/工具产物
+*.o
+*.ko
+*.img
+*.apk
+target/
+out/
+.tmp/
+patchwork/
+a/
+b/
+
+# 本地临时
+*.log
+*.bak
+*.orig
+*.rej
+.token
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

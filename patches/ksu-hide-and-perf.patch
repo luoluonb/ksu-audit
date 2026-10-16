@@ -1,0 +1,333 @@
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 0ca7529..5c65292 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -92,7 +92,9 @@ module_param_named(bundled, ksu_bundled, bool, 0);
+ 
+ int __init kernelsu_init(void)
+ {
++#ifdef CONFIG_KSU_DEBUG
+     pr_info("welcome to KernelSU version " __stringify(KERNEL_SU_VERSION) ", package name " KSU_PACKAGE_NAME "\n");
++#endif
+ #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
+     // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set
+     if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
+diff --git a/kernel/hook/setuid_hook.c b/kernel/hook/setuid_hook.c
+index d3f3ac4..50e7099 100644
+--- a/kernel/hook/setuid_hook.c
++++ b/kernel/hook/setuid_hook.c
+@@ -25,7 +25,10 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
+ {
+     // we rely on the fact that zygote always call setresuid(3) with same uids
+ 
+-    pr_info("handle_setresuid from %d to %d\n", old_uid, new_uid);
++    // Hot path: every zygote fork lands here. Keep it silent unless debug
++    // logging is enabled, otherwise the kernel log carries one line per app
++    // process and leaks the whole uid transition history.
++    pr_debug("handle_setresuid from %d to %d\n", old_uid, new_uid);
+ 
+     if (unlikely(is_uid_manager(new_uid))) {
+         spin_lock_irq(&current->sighand->siglock);
+diff --git a/kernel/hook/tp_marker.c b/kernel/hook/tp_marker.c
+index c78bbbd..6566923 100644
+--- a/kernel/hook/tp_marker.c
++++ b/kernel/hook/tp_marker.c
+@@ -95,10 +95,10 @@ void ksu_mark_running_process_locked(void)
+         bool is_init = t->pid == 1;
+         if (ksu_root_process || is_zygote_process || is_shell || is_init || ksu_is_allow_uid(uid)) {
+             ksu_set_task_tracepoint_flag(t);
+-            pr_info("tp_marker: mark process: pid:%d, uid: %d, comm:%s\n", t->pid, uid, t->comm);
++            pr_debug("tp_marker: mark process: pid:%d, uid: %d, comm:%s\n", t->pid, uid, t->comm);
+         } else {
+             ksu_clear_task_tracepoint_flag(t);
+-            pr_info("tp_marker: unmark process: pid:%d, uid: %d, comm:%s\n", t->pid, uid, t->comm);
++            pr_debug("tp_marker: unmark process: pid:%d, uid: %d, comm:%s\n", t->pid, uid, t->comm);
+         }
+         put_cred(cred);
+     }
+diff --git a/kernel/include/klog.h b/kernel/include/klog.h
+index a934027..9784afa 100644
+--- a/kernel/include/klog.h
++++ b/kernel/include/klog.h
+@@ -5,7 +5,13 @@
+ 
+ #ifdef pr_fmt
+ #undef pr_fmt
++#ifdef CONFIG_KSU_DEBUG
+ #define pr_fmt(fmt) "KernelSU: " fmt
++#else
++// Release builds must not stamp every kernel message with a KernelSU marker:
++// the "<N>KernelSU: ..." prefix in dmesg is a one-line root fingerprint.
++#define pr_fmt(fmt) fmt
++#endif
+ #endif
+ 
+ #endif
+diff --git a/kernel/runtime/ksud_integration.c b/kernel/runtime/ksud_integration.c
+index e8c6994..f07047f 100644
+--- a/kernel/runtime/ksud_integration.c
++++ b/kernel/runtime/ksud_integration.c
+@@ -301,7 +301,7 @@ static ssize_t read_proxy(struct file *file, char __user *buf, size_t count, lof
+     if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
+         return ret;
+     }
+-    pr_info("read_proxy: orig read finished, start append rc\n");
++    pr_debug("read_proxy: orig read finished, start append rc\n");
+ 
+ append_ksu_rc:
+     if (ksu_rc_pos < ksu_rc_len) {
+@@ -310,14 +310,14 @@ append_ksu_rc:
+             append_count = count - ret;
+         // copy_to_user returns the number of bytes that could not be copied
+         if (copy_to_user(buf + ret, KERNEL_SU_RC + ksu_rc_pos, append_count)) {
+-            pr_info("read_proxy: append error, totally appended %ld\n", ksu_rc_pos);
++            pr_debug("read_proxy: append error, totally appended %ld\n", ksu_rc_pos);
+             return ret;
+         }
+-        pr_info("read_proxy: append static %zu\n", append_count);
++        pr_debug("read_proxy: append static %zu\n", append_count);
+         ksu_rc_pos += append_count;
+         ret += append_count;
+         if (ksu_rc_pos == ksu_rc_len)
+-            pr_info("read_proxy: static append done\n");
++            pr_debug("read_proxy: static append done\n");
+     }
+ 
+ append_module_rc:
+@@ -326,14 +326,14 @@ append_module_rc:
+         if (append_count > count - ret)
+             append_count = count - ret;
+         if (copy_to_user(buf + ret, module_rc_buf + module_rc_pos, append_count)) {
+-            pr_info("read_proxy: module append error, totally appended %zd\n", module_rc_pos);
++            pr_debug("read_proxy: module append error, totally appended %zd\n", module_rc_pos);
+             return ret;
+         }
+-        pr_info("read_proxy: append module %zu\n", append_count);
++        pr_debug("read_proxy: append module %zu\n", append_count);
+         module_rc_pos += append_count;
+         ret += append_count;
+         if (module_rc_pos == (ssize_t)module_rc_len) {
+-            pr_info("read_proxy: module append done\n");
++            pr_debug("read_proxy: module append done\n");
+             free_module_rc();
+         }
+     }
+@@ -357,21 +357,21 @@ static ssize_t read_iter_proxy(struct kiocb *iocb, struct iov_iter *to)
+     if (ksu_rc_pos >= ksu_rc_len && module_rc_pos >= module_rc_len) {
+         return ret;
+     }
+-    pr_info("read_iter_proxy: orig read finished, start append rc\n");
++    pr_debug("read_iter_proxy: orig read finished, start append rc\n");
+ 
+ append_ksu_rc:
+     if (ksu_rc_pos < ksu_rc_len) {
+         // copy_to_iter returns the number of bytes successfully copied
+         append_count = copy_to_iter(KERNEL_SU_RC + ksu_rc_pos, ksu_rc_len - ksu_rc_pos, to);
+         if (!append_count) {
+-            pr_info("read_iter_proxy: append error, totally appended %ld\n", ksu_rc_pos);
++            pr_debug("read_iter_proxy: append error, totally appended %ld\n", ksu_rc_pos);
+             return ret;
+         }
+-        pr_info("read_iter_proxy: append static %zu\n", append_count);
++        pr_debug("read_iter_proxy: append static %zu\n", append_count);
+         ksu_rc_pos += append_count;
+         ret += append_count;
+         if (ksu_rc_pos == ksu_rc_len) {
+-            pr_info("read_iter_proxy: static append done\n");
++            pr_debug("read_iter_proxy: static append done\n");
+         }
+     }
+ 
+@@ -379,14 +379,14 @@ append_module_rc:
+     if (module_rc_pos < module_rc_len) {
+         append_count = copy_to_iter(module_rc_buf + module_rc_pos, module_rc_len - module_rc_pos, to);
+         if (!append_count) {
+-            pr_info("read_iter_proxy: module append error, appended %zd\n", module_rc_pos);
++            pr_debug("read_iter_proxy: module append error, appended %zd\n", module_rc_pos);
+             return ret;
+         }
+-        pr_info("read_iter_proxy: append module %zu\n", append_count);
++        pr_debug("read_iter_proxy: append module %zu\n", append_count);
+         module_rc_pos += append_count;
+         ret += append_count;
+         if (module_rc_pos == (ssize_t)module_rc_len) {
+-            pr_info("read_iter_proxy: module append done\n");
++            pr_debug("read_iter_proxy: module append done\n");
+             free_module_rc();
+         }
+     }
+@@ -444,7 +444,7 @@ static void ksu_install_rc_hook(struct file *file)
+ 
+     load_module_rc_once();
+ 
+-    pr_info("read init.rc, comm: %s, rc_count: %zu, module_rc: %zu\n", current->comm, ksu_rc_len, module_rc_len);
++    pr_debug("read init.rc, comm: %s, rc_count: %zu, module_rc: %zu\n", current->comm, ksu_rc_len, module_rc_len);
+ 
+     // Now we need to proxy the read and modify the result!
+     // But, we can not modify the file_operations directly, because it's in read-only memory.
+@@ -464,6 +464,14 @@ static void ksu_install_rc_hook(struct file *file)
+ 
+ static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+ {
++    /*
++     * Only init reads /system/etc/init/hw/init.rc, and only during early boot.
++     * Returning before fget()/d_path() keeps this hook off the system-wide
++     * read() hot path instead of paying for it on every read in the system.
++     */
++    if (current->pid != 1)
++        return;
++
+     struct file *file = fget(fd);
+     if (!file) {
+         return;
+@@ -483,7 +491,7 @@ int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *v
+ {
+     if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {
+         int val = *value;
+-        pr_info("KEY_VOLUMEDOWN val: %d\n", val);
++        pr_debug("KEY_VOLUMEDOWN val: %d\n", val);
+         if (val) {
+             // key pressed, count it
+             volumedown_pressed_count += 1;
+@@ -576,6 +584,10 @@ static long ksu_sys_read(const struct pt_regs *regs)
+ static long (*orig_sys_fstat)(const struct pt_regs *regs);
+ static long ksu_sys_fstat(const struct pt_regs *regs)
+ {
++    // Same reasoning as ksu_handle_sys_read(): only init fstat()s init.rc.
++    if (current->pid != 1)
++        return orig_sys_fstat(regs);
++
+     unsigned int fd = PT_REGS_SYSCALL_PARM1(regs);
+     void __user *statbuf = (void __user *)PT_REGS_PARM2(regs);
+     bool is_rc = false;
+@@ -584,7 +596,7 @@ static long ksu_sys_fstat(const struct pt_regs *regs)
+     struct file *file = fget(fd);
+     if (file) {
+         if (is_init_rc(file)) {
+-            pr_info("stat init.rc");
++            pr_debug("stat init.rc");
+             is_rc = true;
+             load_module_rc_once();
+         }
+@@ -599,9 +611,9 @@ static long ksu_sys_fstat(const struct pt_regs *regs)
+         size_t extra = ksu_rc_len + module_rc_len;
+         if (!copy_from_user_nofault(&size, st_size_ptr, sizeof(long))) {
+             new_size = size + extra;
+-            pr_info("adding rc len: %ld -> %ld (static=%zu module=%zu)", size, new_size, ksu_rc_len, module_rc_len);
++            pr_debug("adding rc len: %ld -> %ld (static=%zu module=%zu)", size, new_size, ksu_rc_len, module_rc_len);
+             if (!copy_to_user_nofault(st_size_ptr, &new_size, sizeof(long))) {
+-                pr_info("added rc len");
++                pr_debug("added rc len");
+             } else {
+                 pr_err("add rc len failed: statbuf 0x%lx", (unsigned long)st_size_ptr);
+             }
+@@ -635,7 +647,7 @@ static void stop_init_rc_hook()
+ {
+     ksu_syscall_table_unhook(__NR_read);
+     ksu_syscall_table_unhook(__NR_fstat);
+-    pr_info("unregister init_rc syscall hook\n");
++    pr_debug("unregister init_rc syscall hook\n");
+ }
+ 
+ void ksu_stop_input_hook_runtime(void)
+@@ -646,7 +658,7 @@ void ksu_stop_input_hook_runtime(void)
+     }
+     input_hook_stopped = true;
+     bool ret = schedule_work(&stop_input_hook_work);
+-    pr_info("unregister input kprobe: %d!\n", ret);
++    pr_debug("unregister input kprobe: %d!\n", ret);
+ }
+ 
+ // ksud: module support
+@@ -658,7 +670,7 @@ void __init ksu_ksud_init()
+     ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
+ 
+     ret = register_kprobe(&input_event_kp);
+-    pr_info("ksud: input_event_kp: %d\n", ret);
++    pr_debug("ksud: input_event_kp: %d\n", ret);
+ 
+     INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
+ }
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index 82ac700..15fb39c 100644
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -726,13 +726,13 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
+         .cmd = KSU_IOCTL_GET_INFO,
+         .name = "GET_INFO",
+         .handler = do_get_info,
+-        .perm_check = always_allow
++        .perm_check = allowed_for_su
+     },
+     {
+         .cmd = KSU_IOCTL_GET_INFO_LEGACY,
+         .name = "GET_INFO_LEGACY",
+         .handler = do_get_info_legacy,
+-        .perm_check = always_allow
++        .perm_check = allowed_for_su
+     },
+     {
+         .cmd = KSU_IOCTL_REPORT_EVENT,
+@@ -750,7 +750,7 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
+         .cmd = KSU_IOCTL_CHECK_SAFEMODE,
+         .name = "CHECK_SAFEMODE",
+         .handler = do_check_safemode,
+-        .perm_check = always_allow
++        .perm_check = allowed_for_su
+     },
+     {
+         .cmd = KSU_IOCTL_GET_ALLOW_LIST,
+@@ -892,18 +892,20 @@ long ksu_supercall_handle_ioctl(const struct file *filp, unsigned int cmd, void
+         }
+     }
+ 
+-    pr_warn("ksu ioctl: unsupported command 0x%x\n", cmd);
++    pr_debug("ksu ioctl: unsupported command 0x%x\n", cmd);
+     return -ENOTTY;
+ }
+ 
+ void __init ksu_supercall_dump_commands(void)
+ {
++#ifdef CONFIG_KSU_DEBUG
+     int i;
+ 
+     pr_info("KernelSU IOCTL Commands:\n");
+     for (i = 0; ksu_ioctl_handlers[i].handler; i++) {
+         pr_info("  %-18s = 0x%08x\n", ksu_ioctl_handlers[i].name, ksu_ioctl_handlers[i].cmd);
+     }
++#endif
+ }
+ 
+ void ksu_supercall_cleanup_state(void)
+diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+index 6db2649..b85611d 100644
+--- a/kernel/supercall/supercall.c
++++ b/kernel/supercall/supercall.c
+@@ -16,6 +16,9 @@
+ #include "arch.h"
+ #include "util.h"
+ #include "klog.h" // IWYU pragma: keep
++#include "manager/manager_identity.h"
++#include "policy/allowlist.h"
++#include <linux/cred.h>
+ 
+ #define KSU_DRIVER_PERMISSION_SU_SESSION (1UL << 0)
+ 
+@@ -120,6 +123,17 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
+     int magic2 = (int)PT_REGS_PARM2(real_regs);
+ 
+     if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2) {
++        /*
++         * Fail closed. Only the manager, root, or an already granted uid may
++         * obtain a driver fd. Any other process that replays the public magic
++         * numbers from uapi/supercall.h gets nothing back, so the install path
++         * can no longer be used to fingerprint the kernel from an ordinary app.
++         */
++        if (unlikely(!is_uid_manager(current_uid().val) && current_uid().val != 0 &&
++                     !ksu_is_allow_uid_for_current(current_uid().val))) {
++            return 0;
++        }
++
+         struct ksu_install_fd_tw *tw;
+         unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
+ 
